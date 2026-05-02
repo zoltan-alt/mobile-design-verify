@@ -107,3 +107,50 @@ def test_realistic_pruning_keeps_visible_text():
     assert "pet-card-luna" in flat
     assert "pet-card-mochi" in flat
     assert "DecorativeImage" not in flat
+
+
+# ---------------------------------------------------------------------------
+# Real Maestro hierarchy shape: properties wrapped in `attributes` sub-object
+# ---------------------------------------------------------------------------
+
+
+def test_keeps_attributes_wrapped_node():
+    """Maestro's actual hierarchy wraps properties in an `attributes` dict."""
+    raw = {
+        "attributes": {
+            "resource-id": "pet-card-luna",
+            "text": "Luna",
+            "class": "FrameLayout",
+        },
+        "children": [],
+    }
+    assert _prune_hierarchy(raw) == {
+        "resource-id": "pet-card-luna",
+        "text": "Luna",
+        "class": "FrameLayout",
+    }
+
+
+def test_drops_attributes_wrapped_node_with_empty_text_and_id():
+    """Empty-string text/id inside attributes is treated the same as missing."""
+    raw = {
+        "attributes": {"text": "", "resource-id": "", "class": "FrameLayout"},
+        "children": [],
+    }
+    assert _prune_hierarchy(raw) is None
+
+
+def test_keeps_attributes_branch_with_id_descendant():
+    """Outer attributes-wrapped node empty; inner has resource-id — branch survives."""
+    raw = {
+        "attributes": {"text": "", "resource-id": "", "class": "RootView"},
+        "children": [
+            {
+                "attributes": {"resource-id": "schedule-row-0", "class": "Cell"},
+                "children": [],
+            },
+        ],
+    }
+    result = _prune_hierarchy(raw)
+    assert result is not None
+    assert result["children"][0]["resource-id"] == "schedule-row-0"

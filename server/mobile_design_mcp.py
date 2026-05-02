@@ -150,9 +150,14 @@ def _find_maestro() -> str | None:
 
 
 def _run_maestro(
-    args: list[str], timeout: int = MAESTRO_DEFAULT_TIMEOUT_SEC
+    args: list[str],
+    timeout: int = MAESTRO_DEFAULT_TIMEOUT_SEC,
+    cwd: str | None = None,
 ) -> dict[str, Any]:
     """Run the maestro CLI. Always returns a dict — never raises subprocess errors.
+
+    ``cwd`` sets the maestro process's working directory. Used for
+    ``takeScreenshot:`` flows, which save PNGs relative to maestro's cwd.
 
     Return shape:
       ``{"ok": bool, "error": str|None, "stdout": str, "stderr_tail": str, "exit": int}``
@@ -172,7 +177,7 @@ def _run_maestro(
     try:
         proc = subprocess.run(
             [maestro_exe, *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, cwd=cwd,
         )
     except subprocess.TimeoutExpired as e:
         return {
@@ -201,6 +206,10 @@ _KEPT_KEYS = ("text", "resource-id", "accessibilityIdentifier", "bounds", "class
 def _prune_hierarchy(node: Any) -> Any:
     """Aggressively trim a Maestro hierarchy node.
 
+    Maestro's actual hierarchy output wraps node properties in an
+    ``attributes`` sub-object; we pull from there first, falling back to
+    top-level keys (useful for synthetic test input and defensive coding).
+
     Keeps: text, resource-id / accessibilityIdentifier, bounds, class, children.
     Drops: subtrees with no text, no id, AND no surviving children.
     Non-dict input is passed through unchanged.
@@ -208,9 +217,19 @@ def _prune_hierarchy(node: Any) -> Any:
     if not isinstance(node, dict):
         return node
 
-    kept: dict[str, Any] = {
-        k: node[k] for k in _KEPT_KEYS if node.get(k) not in (None, "")
-    }
+    attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else None
+    source = attrs if attrs is not None else node
+
+    kept: dict[str, Any] = {}
+    for k in _KEPT_KEYS:
+        v = source.get(k)
+        if v not in (None, ""):
+            kept[k] = v
+    # Defensive: if attributes is present, also check top-level for missing keys
+    if attrs is not None:
+        for k in _KEPT_KEYS:
+            if k not in kept and node.get(k) not in (None, ""):
+                kept[k] = node[k]
 
     children_in = node.get("children") or []
     children_out: list[Any] = []
@@ -240,23 +259,54 @@ def _ts() -> str:
 
 
 def _do_screenshot(platform: Platform) -> dict[str, Any]:
+    """Capture a PNG via a Maestro ``takeScreenshot:`` flow.
+
+    Maestro 2.5.1 has no top-level ``screenshot`` subcommand — only YAML flows
+    can take screenshots. We render a minimal flow with ``appId: "*"`` (no app
+    foreground requirement) and ``takeScreenshot:`` action. The action saves
+    relative to maestro's cwd, so we set cwd=tmp/screenshots/ to land the PNG
+    where we want it.
+    """
     try:
         device_id = _select_device_id(platform)
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
-    out_dir = Path(SCREENSHOTS_DIR)
+    out_dir = Path(SCREENSHOTS_DIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / f"{platform}-{_ts()}.png").resolve()
+    base = f"{platform}-{_ts()}"
+    flow_path = out_dir / f"_flow_{base}.yaml"
+    expected_png = out_dir / f"{base}.png"
 
-    result = _run_maestro(["--device", device_id, "screenshot", str(out_path)])
+    flow_path.write_text(
+        f'appId: "*"\n'
+        f'---\n'
+        f'- takeScreenshot: {base}\n'
+    )
+
+    try:
+        result = _run_maestro(
+            ["--device", device_id, "test", str(flow_path)],
+            cwd=str(out_dir),
+        )
+    finally:
+        flow_path.unlink(missing_ok=True)
+
     if not result["ok"]:
         return {
             "ok": False,
-            "error": result.get("error") or "screenshot failed",
+            "error": result.get("error") or "screenshot flow failed",
             "stderr_tail": result.get("stderr_tail", ""),
         }
-    return {"ok": True, "path": str(out_path)}
+
+    if not expected_png.exists():
+        return {
+            "ok": False,
+            "error": f"flow ran but screenshot not found at {expected_png}",
+            "stderr_tail": result.get("stderr_tail", ""),
+        }
+
+    return {"ok": True, "path": str(expected_png)}
 
 
 # ---------------------------------------------------------------------------
