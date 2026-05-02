@@ -23,17 +23,17 @@ def test_keeps_text_only_node():
 
 
 def test_keeps_node_with_resource_id():
-    raw = {"resource-id": "pet-card-luna", "class": "View"}
+    raw = {"resource-id": "todo-card-0", "class": "View"}
     assert _prune_hierarchy(raw) == {
-        "resource-id": "pet-card-luna",
+        "resource-id": "todo-card-0",
         "class": "View",
     }
 
 
 def test_keeps_node_with_accessibility_identifier():
-    raw = {"accessibilityIdentifier": "pet-detail-hero-mochi", "class": "ImageView"}
+    raw = {"accessibilityIdentifier": "todo-detail-1", "class": "ImageView"}
     assert _prune_hierarchy(raw) == {
-        "accessibilityIdentifier": "pet-detail-hero-mochi",
+        "accessibilityIdentifier": "todo-detail-1",
         "class": "ImageView",
     }
 
@@ -56,7 +56,7 @@ def test_keeps_branch_with_id_descendant():
             {
                 "class": "VStack",
                 "children": [
-                    {"resource-id": "schedule-row-0", "class": "Cell"},
+                    {"resource-id": "todo-step-row-0", "class": "Cell"},
                 ],
             },
         ],
@@ -64,7 +64,7 @@ def test_keeps_branch_with_id_descendant():
     result = _prune_hierarchy(raw)
     assert result is not None
     assert result["class"] == "ScrollView"
-    assert result["children"][0]["children"][0]["resource-id"] == "schedule-row-0"
+    assert result["children"][0]["children"][0]["resource-id"] == "todo-step-row-0"
 
 
 def test_drops_empty_string_values():
@@ -79,7 +79,7 @@ def test_passes_through_non_dict_input():
 
 
 def test_realistic_pruning_keeps_visible_text():
-    """Mirrors the §8.2 smoke test: pet-card-luna must survive pruning."""
+    """Mirrors the v1 smoke test: todo-card-0 must survive pruning."""
     raw = {
         "class": "Application",
         "children": [
@@ -89,13 +89,13 @@ def test_realistic_pruning_keeps_visible_text():
                 "children": [
                     {"class": "DecorativeImage"},  # dropped
                     {
-                        "accessibilityIdentifier": "pet-card-luna",
-                        "text": "Luna",
+                        "accessibilityIdentifier": "todo-card-0",
+                        "text": "Buy groceries",
                         "class": "Card",
                     },
                     {
-                        "accessibilityIdentifier": "pet-card-mochi",
-                        "text": "Mochi",
+                        "accessibilityIdentifier": "todo-card-1",
+                        "text": "Reply to emails",
                         "class": "Card",
                     },
                 ],
@@ -104,8 +104,8 @@ def test_realistic_pruning_keeps_visible_text():
     }
     result = _prune_hierarchy(raw)
     flat = repr(result)
-    assert "pet-card-luna" in flat
-    assert "pet-card-mochi" in flat
+    assert "todo-card-0" in flat
+    assert "todo-card-1" in flat
     assert "DecorativeImage" not in flat
 
 
@@ -118,15 +118,15 @@ def test_keeps_attributes_wrapped_node():
     """Maestro's actual hierarchy wraps properties in an `attributes` dict."""
     raw = {
         "attributes": {
-            "resource-id": "pet-card-luna",
-            "text": "Luna",
+            "resource-id": "todo-card-0",
+            "text": "Buy groceries",
             "class": "FrameLayout",
         },
         "children": [],
     }
     assert _prune_hierarchy(raw) == {
-        "resource-id": "pet-card-luna",
-        "text": "Luna",
+        "resource-id": "todo-card-0",
+        "text": "Buy groceries",
         "class": "FrameLayout",
     }
 
@@ -146,11 +146,11 @@ def test_keeps_attributes_branch_with_id_descendant():
         "attributes": {"text": "", "resource-id": "", "class": "RootView"},
         "children": [
             {
-                "attributes": {"resource-id": "schedule-row-0", "class": "Cell"},
+                "attributes": {"resource-id": "todo-step-row-0", "class": "Cell"},
                 "children": [],
             },
         ],
     }
     result = _prune_hierarchy(raw)
     assert result is not None
-    assert result["children"][0]["resource-id"] == "schedule-row-0"
+    assert result["children"][0]["resource-id"] == "todo-step-row-0"

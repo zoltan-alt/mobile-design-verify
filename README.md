@@ -2,7 +2,7 @@
 
 A Claude Code skill plus an MCP server that lets Claude build, screenshot, tap, and verify native iOS / Flutter / Android UIs against real simulators and emulators — closing the visual feedback loop on mobile UI work.
 
-> **v0.1 — scaffold.** Setup, prerequisites, and quick-start documentation are still being written. The example app will live at `examples/pet-care-verify/`; the Claude Code skill definition will live at `SKILL.md`.
+> **v0.1 — scaffold.** Setup, prerequisites, and quick-start documentation are still being written. The example app will live at `examples/todo-verify/`; the Claude Code skill definition will live at `SKILL.md`.
 
 ## License
 
