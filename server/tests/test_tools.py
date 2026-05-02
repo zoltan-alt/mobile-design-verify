@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest  # noqa: E402
 
 from mobile_design_mcp import (  # noqa: E402
+    _do_playground_create,
     _normalize_key,
+    _playground_root,
     _render_flow,
     _scroll_coords,
     _selector_yaml,
@@ -203,3 +205,50 @@ def test_render_flow_input_text_escapes_quotes():
     # The substituted token already contains escaped quotes in JSON form
     assert 'inputText:' in rendered
     assert '\\"world\\"' in rendered
+
+
+# ---------------------------------------------------------------------------
+# _do_playground_create — validation + idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_playground_create_rejects_invalid_name_uppercase():
+    result = _do_playground_create(name="MyProject")
+    assert result["ok"] is False
+    assert "lowercase" in result["error"]
+
+
+def test_playground_create_rejects_invalid_name_starts_with_digit():
+    result = _do_playground_create(name="1sketch")
+    assert result["ok"] is False
+
+
+def test_playground_create_rejects_invalid_name_with_dash():
+    result = _do_playground_create(name="my-sketch")
+    assert result["ok"] is False
+
+
+def test_playground_create_rejects_invalid_name_empty():
+    result = _do_playground_create(name="")
+    assert result["ok"] is False
+
+
+def test_playground_create_idempotent_when_path_exists(tmp_path, monkeypatch):
+    # Stub the playground root to a tmp path with a pre-existing project dir.
+    fake_existing = tmp_path / "preexisting_sketch"
+    fake_existing.mkdir()
+    monkeypatch.setattr(
+        "mobile_design_mcp._playground_root",
+        lambda: tmp_path,
+    )
+    result = _do_playground_create(name="preexisting_sketch")
+    assert result["ok"] is True
+    assert result["exists"] is True
+    assert result["path"] == str(fake_existing)
+    assert result["name"] == "preexisting_sketch"
+
+
+def test_playground_root_returns_path_under_temp(monkeypatch):
+    monkeypatch.setenv("TEMP", r"C:\fake-temp")
+    root = _playground_root()
+    assert "mobile-design-playground" in str(root)

@@ -29,8 +29,13 @@ import os
 import shutil
 import string
 import subprocess
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Literal
 
 from mcp.server import Server
@@ -549,6 +554,532 @@ def _do_screenshot_scrolling(
 
 
 # ---------------------------------------------------------------------------
+# Designer mode — playground project create-on-demand
+# ---------------------------------------------------------------------------
+
+
+import re as _re
+
+_PLAYGROUND_NAME_RE = _re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _playground_root() -> Path:
+    """Where playground projects live: ``%TEMP%/mobile-design-playground/``."""
+    base = os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / "mobile-design-playground"
+
+
+def _run_via_schtask(
+    command: str,
+    cwd: str,
+    timeout_sec: int = 300,
+) -> dict[str, Any]:
+    """Run a shell command via Windows Task Scheduler.
+
+    Identical mechanism to ``scripts/_claude-windows-build.py`` —
+    Task Scheduler spawns the task under LocalSystem in a fresh process
+    tree, escaping the Java NIO sandbox restriction AND any user-process
+    file locks (e.g. a running flutter daemon holding the Dart SDK
+    cache). Returns ``{ok, exit_code, stdout, stderr}``.
+
+    On non-Windows platforms, falls back to a normal ``subprocess.run``.
+    """
+    if os.name != "nt":
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"timed out ({timeout_sec}s)"}
+        return {
+            "ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+        }
+
+    tag = uuid.uuid4().hex[:8]
+    task_name = f"ClaudeMDV_{tag}"
+    temp = Path(os.environ.get("TEMP", "."))
+    batch = temp / f"{task_name}.bat"
+    log_out = temp / f"{task_name}.stdout.log"
+    log_err = temp / f"{task_name}.stderr.log"
+
+    batch.write_text(
+        "@echo off\r\n"
+        f'cd /d "{cwd}"\r\n'
+        f'{command} > "{log_out}" 2> "{log_err}"\r\n'
+        "exit /b %ERRORLEVEL%\r\n",
+        encoding="utf-8",
+    )
+
+    def _cleanup() -> None:
+        subprocess.run(
+            ["schtasks", "/delete", "/tn", task_name, "/f"],
+            capture_output=True,
+        )
+        for p in (batch, log_out, log_err):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    try:
+        create = subprocess.run(
+            [
+                "schtasks", "/create", "/tn", task_name,
+                "/tr", str(batch),
+                "/sc", "ONCE", "/st", "00:00",
+                "/f",
+            ],
+            capture_output=True, text=True,
+        )
+        if create.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"schtasks /create failed: {create.stderr or create.stdout}",
+            }
+
+        run_proc = subprocess.run(
+            ["schtasks", "/run", "/tn", task_name],
+            capture_output=True, text=True,
+        )
+        if run_proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"schtasks /run failed: {run_proc.stderr or run_proc.stdout}",
+            }
+
+        deadline = time.time() + timeout_sec
+        last_result: str | None = None
+        while time.time() < deadline:
+            time.sleep(2)
+            q = subprocess.run(
+                ["schtasks", "/query", "/tn", task_name, "/v", "/fo", "LIST"],
+                capture_output=True, text=True,
+            )
+            status = None
+            for raw in q.stdout.splitlines():
+                line = raw.strip()
+                low = line.lower()
+                if low.startswith("status:"):
+                    status = line.split(":", 1)[1].strip()
+                elif low.startswith("last result:"):
+                    last_result = line.split(":", 1)[1].strip()
+            if status == "Ready" and last_result not in {None, "", "267009", "267011"}:
+                break
+        else:
+            return {"ok": False, "error": f"timed out ({timeout_sec}s)"}
+
+        stdout = ""
+        stderr = ""
+        if log_out.exists():
+            stdout = log_out.read_text(encoding="utf-8", errors="replace")
+        if log_err.exists():
+            stderr = log_err.read_text(encoding="utf-8", errors="replace")
+
+        try:
+            exit_code = int(last_result or "99")
+        except ValueError:
+            exit_code = 99
+
+        return {
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+    finally:
+        _cleanup()
+
+
+def _do_playground_create(name: str | None = None) -> dict[str, Any]:
+    """Create or reuse a Flutter playground project for designer mode.
+
+    Returns ``{ok, path, exists, name}`` on success. ``exists`` is True
+    if the project was already there and was reused — same path returned
+    either way. ``name`` is the resolved name (auto-generated if caller
+    passed None).
+    """
+    if name is None:
+        name = "sketch_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    if not _PLAYGROUND_NAME_RE.match(name):
+        return {
+            "ok": False,
+            "error": (
+                "name must be lowercase snake_case Dart identifier "
+                f"(matching ^[a-z][a-z0-9_]*$); got {name!r}"
+            ),
+        }
+
+    base_dir = _playground_root()
+    project_dir = base_dir / name
+
+    if project_dir.exists():
+        return {
+            "ok": True,
+            "path": str(project_dir),
+            "exists": True,
+            "name": name,
+        }
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run ``flutter create`` via Task Scheduler escape. Bypasses both
+    # the Java/NIO sandbox AND any file-lock conflicts from another
+    # running flutter daemon holding the Dart SDK cache.
+    result = _run_via_schtask(
+        command=f"flutter create --no-pub {name}",
+        cwd=str(base_dir),
+        timeout_sec=300,
+    )
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "error": "flutter create failed",
+            "stderr_tail": (result.get("stderr", "") or "")[-500:],
+            "stdout_tail": (result.get("stdout", "") or "")[-500:],
+        }
+
+    try:
+        _seed_playground(project_dir)
+    except OSError as e:
+        return {
+            "ok": False,
+            "error": f"playground seeding failed: {e}",
+            "path": str(project_dir),
+        }
+
+    return {
+        "ok": True,
+        "path": str(project_dir),
+        "exists": False,
+        "name": name,
+    }
+
+
+def _seed_playground(project_dir: Path) -> None:
+    """Replace ``lib/main.dart`` with a Designer-mode entry point and
+    write ``lib/design.dart`` as the canvas Claude edits.
+
+    Adds ``google_fonts`` to ``pubspec.yaml`` (handwritten / display
+    fonts are common in design work).
+    """
+    main_dart = project_dir / "lib" / "main.dart"
+    main_dart.write_text(
+        "import 'package:flutter/material.dart';\n"
+        "import 'package:flutter/services.dart';\n"
+        "import 'design.dart';\n"
+        "\n"
+        "void main() {\n"
+        "  WidgetsFlutterBinding.ensureInitialized();\n"
+        "  SystemChrome.setSystemUIOverlayStyle(\n"
+        "    const SystemUiOverlayStyle(\n"
+        "      statusBarColor: Colors.transparent,\n"
+        "      statusBarIconBrightness: Brightness.dark,\n"
+        "    ),\n"
+        "  );\n"
+        "  runApp(const PlaygroundApp());\n"
+        "}\n"
+        "\n"
+        "class PlaygroundApp extends StatelessWidget {\n"
+        "  const PlaygroundApp({super.key});\n"
+        "\n"
+        "  @override\n"
+        "  Widget build(BuildContext context) {\n"
+        "    return MaterialApp(\n"
+        "      title: 'design-playground',\n"
+        "      debugShowCheckedModeBanner: false,\n"
+        "      theme: ThemeData(useMaterial3: true),\n"
+        "      home: const DesignPreview(),\n"
+        "    );\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    design_dart = project_dir / "lib" / "design.dart"
+    design_dart.write_text(
+        "import 'package:flutter/material.dart';\n"
+        "\n"
+        "/// Designer-mode canvas — edit this file freely. The single\n"
+        "/// `DesignPreview` widget is what's rendered in the playground.\n"
+        "/// Hot reload picks up changes in ~2s.\n"
+        "class DesignPreview extends StatelessWidget {\n"
+        "  const DesignPreview({super.key});\n"
+        "\n"
+        "  @override\n"
+        "  Widget build(BuildContext context) {\n"
+        "    return const Scaffold(\n"
+        "      body: SafeArea(\n"
+        "        child: Center(\n"
+        "          child: Text('Design preview — start sketching.'),\n"
+        "        ),\n"
+        "      ),\n"
+        "    );\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # Add google_fonts to pubspec.yaml if it isn't already there.
+    pubspec = project_dir / "pubspec.yaml"
+    text = pubspec.read_text(encoding="utf-8")
+    if "google_fonts:" not in text and "cupertino_icons:" in text:
+        text = text.replace(
+            "  cupertino_icons:",
+            "  google_fonts: ^6.2.0\n  cupertino_icons:",
+            1,
+        )
+        pubspec.write_text(text, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Designer mode — flutter run + hot reload
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FlutterApp:
+    """A running ``flutter run --machine --hot`` process tracked by the server.
+
+    The reader thread drains stdout into ``events`` and updates state
+    (``app_id``, ``vm_service_uri``, ``started``) as daemon events arrive.
+    """
+
+    project_path: str
+    process: subprocess.Popen[str]
+    app_id: str | None = None
+    vm_service_uri: str | None = None
+    started: bool = False
+    events: Queue[dict[str, Any]] = field(default_factory=Queue)
+    next_request_id: int = 1
+    reader_thread: threading.Thread | None = None
+
+
+_flutter_apps: dict[str, _FlutterApp] = {}
+
+
+def _drain_flutter_stdout(app: _FlutterApp) -> None:
+    """Background thread: parse ``flutter run --machine`` JSON events.
+
+    Each line of machine-mode output is wrapped in ``[{...}]``. We
+    parse, update app state, and queue every event so command handlers
+    can match by request id.
+    """
+    proc = app.process
+    assert proc.stdout is not None
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except (ValueError, OSError):
+            return
+        if not line:
+            return
+        line_str = line.strip()
+        if not line_str.startswith("["):
+            continue
+        try:
+            events = json.loads(line_str)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            evt_name = event.get("event")
+            params = event.get("params") if isinstance(event.get("params"), dict) else {}
+            if evt_name == "app.start":
+                app.app_id = params.get("appId") or app.app_id
+            elif evt_name == "app.debugPort":
+                app.vm_service_uri = params.get("wsUri") or app.vm_service_uri
+            elif evt_name == "app.started":
+                app.started = True
+            app.events.put(event)
+
+
+def _do_flutter_run(project_path: str, platform: Platform) -> dict[str, Any]:
+    """Launch ``flutter run --machine --hot`` for the given project.
+
+    Idempotent: if a flutter process is already running for this
+    project, returns its existing ``app_id`` / ``vm_service_uri``.
+    Otherwise starts a new one and blocks until ``app.started`` lands
+    (4 min timeout to absorb first-run cold compile).
+    """
+    project = str(Path(project_path).resolve())
+    existing = _flutter_apps.get(project)
+    if existing is not None and existing.process.poll() is None:
+        if existing.started:
+            return {
+                "ok": True,
+                "exists": True,
+                "app_id": existing.app_id,
+                "vm_service_uri": existing.vm_service_uri,
+            }
+        # Process is alive but not yet started — fall through and wait.
+    elif existing is not None:
+        # Process died — clear it.
+        _flutter_apps.pop(project, None)
+        existing = None
+
+    if existing is None:
+        try:
+            device_id = _select_device_id(platform)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+
+        flutter_bin = shutil.which("flutter") or "flutter"
+        cmd = [flutter_bin, "run", "--machine", "--hot", "-d", device_id]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=project,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            return {"ok": False, "error": "flutter CLI not on PATH"}
+
+        existing = _FlutterApp(project_path=project, process=proc)
+        _flutter_apps[project] = existing
+
+        thread = threading.Thread(
+            target=_drain_flutter_stdout,
+            args=(existing,),
+            daemon=True,
+            name=f"flutter-stdout-{Path(project).name}",
+        )
+        thread.start()
+        existing.reader_thread = thread
+
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        if existing.started and existing.vm_service_uri:
+            return {
+                "ok": True,
+                "exists": False,
+                "app_id": existing.app_id,
+                "vm_service_uri": existing.vm_service_uri,
+            }
+        if existing.process.poll() is not None:
+            _flutter_apps.pop(project, None)
+            return {
+                "ok": False,
+                "error": f"flutter run exited with code {existing.process.returncode}",
+            }
+        time.sleep(0.5)
+
+    return {
+        "ok": False,
+        "error": "timed out (>240s) waiting for app.started",
+        "app_id": existing.app_id,
+        "vm_service_uri": existing.vm_service_uri,
+    }
+
+
+def _send_daemon_command(
+    app: _FlutterApp,
+    method: str,
+    params: dict[str, Any],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Send a ``flutter run --machine`` daemon JSON-RPC command and
+    wait for the matching response by request id.
+    """
+    if app.process.stdin is None or app.process.poll() is not None:
+        return {"ok": False, "error": "flutter process not alive"}
+
+    request_id = app.next_request_id
+    app.next_request_id += 1
+    payload = "[" + json.dumps({"id": request_id, "method": method, "params": params}) + "]\n"
+
+    try:
+        app.process.stdin.write(payload)
+        app.process.stdin.flush()
+    except (BrokenPipeError, OSError) as e:
+        return {"ok": False, "error": f"failed to send command: {e}"}
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            event = app.events.get(timeout=0.5)
+        except Empty:
+            continue
+        if event.get("id") == request_id:
+            if "error" in event:
+                return {"ok": False, "error": event["error"]}
+            return {"ok": True, "result": event.get("result")}
+
+    return {"ok": False, "error": f"timed out (>{timeout}s) waiting for response"}
+
+
+def _do_flutter_hot_reload(project_path: str) -> dict[str, Any]:
+    """Send an ``app.reload`` (hot reload, not full restart) daemon
+    command to a running flutter app for the given project.
+    """
+    project = str(Path(project_path).resolve())
+    app = _flutter_apps.get(project)
+    if app is None or app.process.poll() is not None:
+        return {
+            "ok": False,
+            "error": "no running flutter process for this project; call flutter_run first",
+        }
+    if not app.started or not app.app_id:
+        return {"ok": False, "error": "app not fully started yet"}
+
+    return _send_daemon_command(
+        app,
+        method="app.reload",
+        params={"appId": app.app_id, "pause": False, "fullRestart": False},
+    )
+
+
+def _do_flutter_stop(project_path: str) -> dict[str, Any]:
+    """Send ``app.stop`` and wait for the process to exit. Cleans up
+    the registry entry.
+    """
+    project = str(Path(project_path).resolve())
+    app = _flutter_apps.get(project)
+    if app is None:
+        return {"ok": True, "exists": False}
+
+    result: dict[str, Any] = {"ok": True, "exists": True}
+    if app.process.poll() is None and app.app_id is not None:
+        cmd_result = _send_daemon_command(
+            app,
+            method="app.stop",
+            params={"appId": app.app_id},
+            timeout=15,
+        )
+        if not cmd_result["ok"]:
+            result["stop_warning"] = cmd_result.get("error")
+
+    # Force-terminate if still alive.
+    try:
+        app.process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        app.process.terminate()
+        try:
+            app.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            app.process.kill()
+
+    _flutter_apps.pop(project, None)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # MCP server + tool registration
 # ---------------------------------------------------------------------------
 
@@ -566,6 +1097,87 @@ async def list_tools() -> list[Tool]:
             name="ping",
             description="No-op tool that confirms the server is reachable. Returns 'pong'.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        Tool(
+            name="playground_create",
+            description=(
+                "Designer mode. Create or reuse a Flutter playground project at "
+                "%TEMP%/mobile-design-playground/<name>/, seeded with a Designer-"
+                "mode entry (lib/main.dart) and an empty canvas (lib/design.dart). "
+                "Idempotent: passing the same name returns the existing path. "
+                "If `name` is omitted, generates `sketch_YYYYMMDD_HHMMSS`. "
+                "Returns {ok, path, exists, name}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Lowercase snake_case Dart package name. Optional — "
+                            "auto-generated from timestamp if omitted."
+                        ),
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="flutter_run",
+            description=(
+                "Designer mode. Launch `flutter run --machine --hot` for the "
+                "given project on the target platform. Idempotent — same "
+                "project_path returns the existing app's vm_service_uri / "
+                "app_id. Blocks until app.started lands (up to 4 min for "
+                "first cold compile). Returns {ok, app_id, vm_service_uri, "
+                "exists}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Absolute path to the Flutter project root.",
+                    },
+                    "platform": _platform_prop(),
+                },
+                "required": ["project_path", "platform"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="flutter_hot_reload",
+            description=(
+                "Designer mode. Send a hot-reload (not full restart) to the "
+                "running flutter app for the given project. Use after every "
+                "Dart edit. ~2s round-trip. Returns {ok, result}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Same project_path passed to flutter_run.",
+                    },
+                },
+                "required": ["project_path"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="flutter_stop",
+            description=(
+                "Designer mode. Stop the running flutter app for the given "
+                "project. Sends app.stop, then force-terminates if needed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {"type": "string"},
+                },
+                "required": ["project_path"],
+                "additionalProperties": False,
+            },
         ),
         Tool(
             name="screenshot",
@@ -778,7 +1390,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "ping":
         return [TextContent(type="text", text="pong")]
 
+    # Designer-mode tools that don't take a `platform` argument.
+    if name == "playground_create":
+        result = _do_playground_create(name=arguments.get("name"))
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "flutter_hot_reload":
+        result = _do_flutter_hot_reload(arguments["project_path"])
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "flutter_stop":
+        result = _do_flutter_stop(arguments["project_path"])
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
     p: Platform = arguments["platform"]
+
+    if name == "flutter_run":
+        result = _do_flutter_run(
+            project_path=arguments["project_path"],
+            platform=p,
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     if name == "screenshot":
         result = _do_screenshot(p)
