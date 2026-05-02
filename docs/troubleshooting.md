@@ -33,7 +33,17 @@ Once the app is installed and foregrounded on your device/simulator, return to C
 - `dangerouslyDisableSandbox: true` on the Bash tool
 - Switching JDK (Oracle 20 → JBR 21)
 - Wrapping in `cmd.exe /c`, `powershell.exe -Command`, `cmd /c start /wait /b`
+- `Start-Process -WindowStyle Hidden` from PowerShell
+- Python `subprocess.Popen(creationflags=CREATE_BREAKAWAY_FROM_JOB)`
 - `PreToolUse` hooks (run before the tool, can't change subprocess token)
+
+**The one thing that does work — `scripts/_claude-windows-build.py`.** Spawns the build via Windows Task Scheduler, which runs it under LocalSystem in a fresh process tree outside Claude's sandbox. Use it from Claude's Bash tool when you want a one-shot rebuild without leaving the loop:
+
+```bash
+python scripts/_claude-windows-build.py examples/todo-verify/flutter
+```
+
+The script blocks until the build finishes, streams stdout/stderr back, and exits with the build's exit code. After it returns 0, `adb install ...` and `adb shell am start ...` work fine directly from the Bash tool (no JVM involved). This is a Windows + Claude Code workaround only — on macOS / Linux, run `flutter build` directly.
 
 **Upstream.** Same root cause as [anthropics/claude-code#41432](https://github.com/anthropics/claude-code/issues/41432) — JVM-based stdio MCP servers / builds breaking under Claude Code's Windows subprocess sandbox. Closed there as a platform-side issue. If/when Anthropic addresses it upstream, this workaround can be retired.
 

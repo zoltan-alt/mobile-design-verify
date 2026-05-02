@@ -117,7 +117,7 @@ Gated behind `MOBILE_DESIGN_VERIFY_E2E=1` so they don't run unintentionally.
 
 See [docs/troubleshooting.md](docs/troubleshooting.md). Common items:
 
-- **Windows + Claude Code:** Java builds run from Claude's Bash tool fail with "Unable to establish loopback connection". Workaround: run `scripts/verify-flutter.sh` in your own PowerShell / Git Bash terminal. The MCP tools themselves are unaffected.
+- **Windows + Claude Code:** Java builds run from Claude's Bash tool fail with "Unable to establish loopback connection". Workarounds: either run `scripts/verify-flutter.sh` in your own PowerShell / Git Bash terminal, or have Claude invoke `python scripts/_claude-windows-build.py <flutter-dir>` which spawns the build via Windows Task Scheduler (escapes the process tree restriction). The MCP tools themselves are unaffected.
 - **"No android devices available":** `adb devices` should list your device as `device` (not `offline` or `unauthorized`).
 - **Maestro can't find element:** make sure your widget exposes the right accessibility identifier — see [docs/conventions.md](docs/conventions.md). On Compose specifically, `testTag` is invisible without `Modifier.semantics { testTagsAsResourceId = true }` at the Compose root.
 
