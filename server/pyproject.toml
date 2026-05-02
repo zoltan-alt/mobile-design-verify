@@ -1,0 +1,38 @@
+# Copyright 2026 zoltan-alt — Licensed under Apache-2.0. See LICENSE.
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mobile-design-verify"
+version = "0.1.0"
+description = "MCP server for verifying native iOS / Flutter / Android UIs against simulators and emulators."
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "zoltan-alt"}]
+keywords = ["mcp", "claude-code", "mobile", "ios", "android", "flutter", "ui", "maestro"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp[cli]>=1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+mobile-design-verify = "mobile_design_mcp:main"
+
+[tool.setuptools]
+py-modules = ["mobile_design_mcp", "config"]
