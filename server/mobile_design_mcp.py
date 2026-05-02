@@ -3,11 +3,22 @@
 """mobile-design-verify MCP server.
 
 Stdio transport. Tools registered:
-  ping (§2.1)            — connectivity check.
-  screenshot (§2.3 #1)   — capture booted iOS Sim / Android emu.
-  view_hierarchy (§2.3 #2) — pruned a11y / view tree of foreground app.
+  ping            — connectivity check
+  screenshot      — capture booted iOS sim / Android device
+  view_hierarchy  — pruned a11y tree of the foreground app
+  launch_app      — foreground an app by bundle id / applicationId
+  kill_app        — stop / force-quit an app by bundle id
+  tap             — tap by id, text, or point
+  scroll          — directional scroll with short/long distance
+  swipe           — coordinate-based swipe
+  type_text       — input text into the focused field
+  press_key       — press hardware/system key (BACK/HOME/ENTER/...)
+  wait_for        — block until id/text becomes visible
+  assert_visible  — assert id/text is visible right now
 
-Maestro is the underlying driver (§2.2 `_run_maestro` shell-out helper).
+Underlying driver: Maestro (`_run_maestro`). Action tools render
+`string.Template` flows from server/flows/*.yaml.tmpl and run via
+`maestro test`.
 """
 
 from __future__ import annotations
@@ -16,6 +27,7 @@ import asyncio
 import json
 import os
 import shutil
+import string
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +47,7 @@ from config import (
 )
 
 Platform = Literal["ios", "android"]
+_FLOWS_DIR = Path(__file__).parent / "flows"
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +56,6 @@ Platform = Literal["ios", "android"]
 
 
 def _booted_ios_devices() -> list[str]:
-    """List of currently-Booted iOS Simulator UDIDs (empty if xcrun missing)."""
     if not shutil.which("xcrun"):
         return []
     try:
@@ -68,7 +80,6 @@ def _booted_ios_devices() -> list[str]:
 
 
 def _online_android_devices() -> list[str]:
-    """List of online Android device serials (excludes 'offline', 'unauthorized')."""
     if not shutil.which("adb"):
         return []
     try:
@@ -81,7 +92,7 @@ def _online_android_devices() -> list[str]:
     if proc.returncode != 0:
         return []
     serials: list[str] = []
-    for line in proc.stdout.splitlines()[1:]:  # skip "List of devices attached"
+    for line in proc.stdout.splitlines()[1:]:
         line = line.strip()
         if not line:
             continue
@@ -92,15 +103,7 @@ def _online_android_devices() -> list[str]:
 
 
 def _select_device_id(platform: Platform) -> str:
-    """Pick the device-id to pass to Maestro.
-
-    Resolution order:
-      1. ``MOBILE_DESIGN_VERIFY_DEVICE_ID`` env var (always wins).
-      2. Single booted iOS sim / online Android device.
-      3. Hard-fail with full device list if 0 or >1 candidates.
-
-    Never guesses silently.
-    """
+    """Pick the device-id for Maestro. Never guesses silently."""
     explicit = os.environ.get(DEVICE_ID_ENV)
     if explicit:
         return explicit
@@ -129,13 +132,7 @@ def _select_device_id(platform: Platform) -> str:
 
 
 def _find_maestro() -> str | None:
-    """Find the maestro executable.
-
-    PATH first (``shutil.which``), then fall back to the well-known curl-install
-    location ``~/.maestro/bin/maestro[.bat]``. Robust on Windows where Claude
-    Code launches the MCP subprocess with the Windows user PATH, not Bash's —
-    so a fresh ``~/.maestro/bin`` addition to ``.bashrc`` doesn't propagate.
-    """
+    """Find maestro: PATH first, then ~/.maestro/bin/maestro[.bat]."""
     on_path = shutil.which("maestro")
     if on_path:
         return on_path
@@ -154,14 +151,7 @@ def _run_maestro(
     timeout: int = MAESTRO_DEFAULT_TIMEOUT_SEC,
     cwd: str | None = None,
 ) -> dict[str, Any]:
-    """Run the maestro CLI. Always returns a dict — never raises subprocess errors.
-
-    ``cwd`` sets the maestro process's working directory. Used for
-    ``takeScreenshot:`` flows, which save PNGs relative to maestro's cwd.
-
-    Return shape:
-      ``{"ok": bool, "error": str|None, "stdout": str, "stderr_tail": str, "exit": int}``
-    """
+    """Run maestro CLI. Always returns a dict — never raises subprocess errors."""
     maestro_exe = _find_maestro()
     if not maestro_exe:
         return {
@@ -170,9 +160,7 @@ def _run_maestro(
                 "`maestro` not found on PATH or at ~/.maestro/bin/. Install: "
                 "https://maestro.mobile.dev/getting-started/installing-maestro"
             ),
-            "stdout": "",
-            "stderr_tail": "",
-            "exit": -1,
+            "stdout": "", "stderr_tail": "", "exit": -1,
         }
     try:
         proc = subprocess.run(
@@ -197,23 +185,79 @@ def _run_maestro(
 
 
 # ---------------------------------------------------------------------------
-# View-hierarchy pruning (used by §2.3 #2)
+# §2.5 — Flow rendering + execution helpers
+# ---------------------------------------------------------------------------
+
+
+def _ts() -> str:
+    """ISO-8601 timestamp with microseconds for unique filenames."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _yaml_str(s: str) -> str:
+    """Quote a string for safe YAML embedding (JSON string syntax)."""
+    return json.dumps(s)
+
+
+def _selector_yaml(*, id: str | None = None, text: str | None = None) -> str | None:
+    """Build a Maestro selector fragment. Returns None if neither is provided."""
+    if id is not None:
+        return f"id: {_yaml_str(id)}"
+    if text is not None:
+        return f"text: {_yaml_str(text)}"
+    return None
+
+
+def _render_flow(template_name: str, **kwargs: str) -> str:
+    """Render server/flows/<template_name>.yaml.tmpl with substitutions."""
+    path = _FLOWS_DIR / f"{template_name}.yaml.tmpl"
+    template = string.Template(path.read_text(encoding="utf-8"))
+    return template.substitute(**kwargs)
+
+
+def _run_flow(
+    platform: Platform,
+    flow_yaml: str,
+    timeout: int = MAESTRO_DEFAULT_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Write a YAML flow to a temp file and run it via `maestro test`."""
+    try:
+        device_id = _select_device_id(platform)
+    except RuntimeError as e:
+        return {"ok": False, "error": str(e)}
+
+    tmp_dir = Path(SCREENSHOTS_DIR).resolve()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    flow_path = tmp_dir / f"_flow_{_ts()}.yaml"
+    flow_path.write_text(flow_yaml, encoding="utf-8")
+
+    try:
+        result = _run_maestro(
+            ["--device", device_id, "test", str(flow_path)],
+            cwd=str(tmp_dir),
+            timeout=timeout,
+        )
+    finally:
+        flow_path.unlink(missing_ok=True)
+
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "error": result.get("error") or "flow failed",
+            "stderr_tail": result.get("stderr_tail", ""),
+        }
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# View-hierarchy pruning (used by view_hierarchy)
 # ---------------------------------------------------------------------------
 
 _KEPT_KEYS = ("text", "resource-id", "accessibilityIdentifier", "bounds", "class")
 
 
 def _prune_hierarchy(node: Any) -> Any:
-    """Aggressively trim a Maestro hierarchy node.
-
-    Maestro's actual hierarchy output wraps node properties in an
-    ``attributes`` sub-object; we pull from there first, falling back to
-    top-level keys (useful for synthetic test input and defensive coding).
-
-    Keeps: text, resource-id / accessibilityIdentifier, bounds, class, children.
-    Drops: subtrees with no text, no id, AND no surviving children.
-    Non-dict input is passed through unchanged.
-    """
+    """Aggressively trim a Maestro hierarchy node (handles `attributes` wrapper)."""
     if not isinstance(node, dict):
         return node
 
@@ -225,7 +269,6 @@ def _prune_hierarchy(node: Any) -> Any:
         v = source.get(k)
         if v not in (None, ""):
             kept[k] = v
-    # Defensive: if attributes is present, also check top-level for missing keys
     if attrs is not None:
         for k in _KEPT_KEYS:
             if k not in kept and node.get(k) not in (None, ""):
@@ -249,24 +292,12 @@ def _prune_hierarchy(node: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.3 #1 — screenshot
+# Tool implementations
 # ---------------------------------------------------------------------------
 
 
-def _ts() -> str:
-    """ISO-8601 timestamp suitable for filenames (UTC, basic format, no colons)."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
 def _do_screenshot(platform: Platform) -> dict[str, Any]:
-    """Capture a PNG via a Maestro ``takeScreenshot:`` flow.
-
-    Maestro 2.5.1 has no top-level ``screenshot`` subcommand — only YAML flows
-    can take screenshots. We render a minimal flow with ``appId: "*"`` (no app
-    foreground requirement) and ``takeScreenshot:`` action. The action saves
-    relative to maestro's cwd, so we set cwd=tmp/screenshots/ to land the PNG
-    where we want it.
-    """
+    """Capture PNG via `takeScreenshot:` flow (saved to tmp/screenshots/)."""
     try:
         device_id = _select_device_id(platform)
     except RuntimeError as e:
@@ -298,20 +329,13 @@ def _do_screenshot(platform: Platform) -> dict[str, Any]:
             "error": result.get("error") or "screenshot flow failed",
             "stderr_tail": result.get("stderr_tail", ""),
         }
-
     if not expected_png.exists():
         return {
             "ok": False,
             "error": f"flow ran but screenshot not found at {expected_png}",
             "stderr_tail": result.get("stderr_tail", ""),
         }
-
     return {"ok": True, "path": str(expected_png)}
-
-
-# ---------------------------------------------------------------------------
-# §2.3 #2 — view_hierarchy
-# ---------------------------------------------------------------------------
 
 
 def _do_hierarchy(platform: Platform) -> dict[str, Any]:
@@ -327,7 +351,6 @@ def _do_hierarchy(platform: Platform) -> dict[str, Any]:
             "error": result.get("error") or "hierarchy failed",
             "stderr_tail": result.get("stderr_tail", ""),
         }
-
     try:
         raw = json.loads(result["stdout"])
     except json.JSONDecodeError as e:
@@ -336,8 +359,147 @@ def _do_hierarchy(platform: Platform) -> dict[str, Any]:
             "error": f"Maestro returned non-JSON hierarchy: {e}",
             "stderr_tail": result.get("stderr_tail", ""),
         }
-
     return {"ok": True, "hierarchy": _prune_hierarchy(raw)}
+
+
+def _do_launch_app(platform: Platform, bundle_id: str) -> dict[str, Any]:
+    flow = _render_flow("launch_app", bundle_id=bundle_id)
+    return _run_flow(platform, flow)
+
+
+def _do_kill_app(platform: Platform, bundle_id: str) -> dict[str, Any]:
+    flow = _render_flow("kill_app", bundle_id=bundle_id)
+    return _run_flow(platform, flow)
+
+
+def _do_tap(
+    platform: Platform,
+    id: str | None = None,
+    text: str | None = None,
+    point: str | None = None,
+) -> dict[str, Any]:
+    if id is not None:
+        selector = f"id: {_yaml_str(id)}"
+    elif text is not None:
+        selector = f"text: {_yaml_str(text)}"
+    elif point is not None:
+        selector = f"point: {_yaml_str(point)}"
+    else:
+        return {"ok": False, "error": "tap requires one of: id, text, point"}
+    flow = _render_flow("tap", selector=selector)
+    return _run_flow(platform, flow)
+
+
+def _scroll_coords(direction: str, distance: str) -> tuple[str, str]:
+    """Compute (start, end) percentage coordinates for a directional scroll.
+
+    direction: "up" / "down" / "left" / "right" (finger movement)
+    distance:  "short" (30%) or "long" (70%)
+    """
+    pct_map = {"short": 30, "long": 70}
+    if distance not in pct_map:
+        raise ValueError(f"distance must be 'short' or 'long' (got {distance!r})")
+    half = pct_map[distance] // 2
+    mid = 50
+
+    direction = direction.lower()
+    if direction == "up":
+        return f"{mid}%, {mid + half}%", f"{mid}%, {mid - half}%"
+    if direction == "down":
+        return f"{mid}%, {mid - half}%", f"{mid}%, {mid + half}%"
+    if direction == "left":
+        return f"{mid + half}%, {mid}%", f"{mid - half}%, {mid}%"
+    if direction == "right":
+        return f"{mid - half}%, {mid}%", f"{mid + half}%, {mid}%"
+    raise ValueError(f"direction must be up/down/left/right (got {direction!r})")
+
+
+def _do_scroll(
+    platform: Platform,
+    direction: str = "down",
+    distance: str = "short",
+) -> dict[str, Any]:
+    try:
+        start, end = _scroll_coords(direction, distance)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    flow = _render_flow("swipe", start=start, end=end)
+    return _run_flow(platform, flow)
+
+
+def _do_swipe(platform: Platform, start: str, end: str) -> dict[str, Any]:
+    flow = _render_flow("swipe", start=start, end=end)
+    return _run_flow(platform, flow)
+
+
+def _do_type_text(platform: Platform, text: str) -> dict[str, Any]:
+    flow = _render_flow("input_text", text=_yaml_str(text))
+    return _run_flow(platform, flow)
+
+
+_KEY_MAP = {
+    "back": "BACK",
+    "home": "HOME",
+    "enter": "ENTER",
+    "esc": "ESCAPE",
+    "escape": "ESCAPE",
+    "tab": "TAB",
+    "delete": "DELETE",
+    "del": "DELETE",
+    "backspace": "BACKSPACE",
+    "vol_up": "VOLUME_UP",
+    "vol_down": "VOLUME_DOWN",
+    "volume_up": "VOLUME_UP",
+    "volume_down": "VOLUME_DOWN",
+}
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a user-friendly key name to a Maestro pressKey value."""
+    upper = key.upper()
+    if upper in set(_KEY_MAP.values()):
+        return upper
+    mapped = _KEY_MAP.get(key.lower())
+    if mapped:
+        return mapped
+    raise ValueError(
+        f"unknown key: {key!r}. Known: {', '.join(sorted(set(_KEY_MAP.values())))}"
+    )
+
+
+def _do_press_key(platform: Platform, key: str) -> dict[str, Any]:
+    try:
+        normalized = _normalize_key(key)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    flow = _render_flow("press_key", key=normalized)
+    return _run_flow(platform, flow)
+
+
+def _do_wait_for(
+    platform: Platform,
+    id: str | None = None,
+    text: str | None = None,
+    timeout: int = 10,
+) -> dict[str, Any]:
+    selector = _selector_yaml(id=id, text=text)
+    if selector is None:
+        return {"ok": False, "error": "wait_for requires one of: id, text"}
+    flow = _render_flow("wait_for", selector=selector, timeout_ms=str(timeout * 1000))
+    # Give the maestro process a buffer beyond the in-flow wait
+    return _run_flow(platform, flow, timeout=timeout + 30)
+
+
+def _do_assert_visible(
+    platform: Platform,
+    id: str | None = None,
+    text: str | None = None,
+) -> dict[str, Any]:
+    selector = _selector_yaml(id=id, text=text)
+    if selector is None:
+        return {"ok": False, "error": "assert_visible requires one of: id, text"}
+    flow = _render_flow("assert_visible", selector=selector)
+    return _run_flow(platform, flow)
 
 
 # ---------------------------------------------------------------------------
@@ -347,33 +509,27 @@ def _do_hierarchy(platform: Platform) -> dict[str, Any]:
 server: Server = Server(SERVER_NAME)
 
 
+def _platform_prop(description: str = "Target platform.") -> dict[str, Any]:
+    return {"type": "string", "enum": ["ios", "android"], "description": description}
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="ping",
             description="No-op tool that confirms the server is reachable. Returns 'pong'.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
             name="screenshot",
             description=(
                 "Capture a PNG screenshot of the currently-booted iOS Simulator or "
-                "Android emulator. Returns the absolute file path on success."
+                "Android device. Returns the absolute file path on success."
             ),
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "platform": {
-                        "type": "string",
-                        "enum": ["ios", "android"],
-                        "description": "Target platform.",
-                    },
-                },
+                "properties": {"platform": _platform_prop()},
                 "required": ["platform"],
                 "additionalProperties": False,
             },
@@ -381,18 +537,163 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="view_hierarchy",
             description=(
-                "Read the accessibility / view hierarchy of the foreground app on the "
-                "currently-booted iOS Simulator or Android emulator. Aggressively pruned "
-                "to keep only text, resource-id / accessibilityIdentifier, bounds, class, "
-                "and non-empty children — to keep model context small."
+                "Read the accessibility / view hierarchy of the foreground app. "
+                "Aggressively pruned — keeps only text, resource-id / "
+                "accessibilityIdentifier, bounds, class, non-empty children."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"platform": _platform_prop()},
+                "required": ["platform"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="launch_app",
+            description="Launch (foreground) an app by its bundle id / Android applicationId.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "bundle_id": {
+                        "type": "string",
+                        "description": "Android applicationId or iOS CFBundleIdentifier.",
+                    },
+                },
+                "required": ["platform", "bundle_id"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="kill_app",
+            description="Stop / force-quit an app by its bundle id.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "bundle_id": {"type": "string"},
+                },
+                "required": ["platform", "bundle_id"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="tap",
+            description=(
+                "Tap on an element. Provide exactly one of: id (preferred), text, or "
+                "point (\"x,y\" coordinates). Precedence: id > text > point."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "platform": {
+                    "platform": _platform_prop(),
+                    "id": {"type": "string", "description": "Accessibility identifier or resource-id."},
+                    "text": {"type": "string", "description": "Visible text content."},
+                    "point": {"type": "string", "description": "Coordinates as \"x,y\" (pixels)."},
+                },
+                "required": ["platform"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="scroll",
+            description=(
+                "Directional scroll on the foreground screen. distance \"short\" is ~30% "
+                "of the screen, \"long\" is ~70%. direction is finger-movement direction."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "direction": {
                         "type": "string",
-                        "enum": ["ios", "android"],
+                        "enum": ["up", "down", "left", "right"],
+                        "description": "Finger-movement direction.",
                     },
+                    "distance": {
+                        "type": "string",
+                        "enum": ["short", "long"],
+                        "default": "short",
+                    },
+                },
+                "required": ["platform", "direction"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="swipe",
+            description=(
+                "Coordinate-based swipe. start and end are \"X%, Y%\" or \"X, Y\" "
+                "strings (e.g. \"50%, 80%\")."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                },
+                "required": ["platform", "start", "end"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="type_text",
+            description="Input text into the currently-focused field.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "text": {"type": "string"},
+                },
+                "required": ["platform", "text"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="press_key",
+            description=(
+                "Press a hardware/system key. Accepts BACK, HOME, ENTER, ESCAPE, TAB, "
+                "DELETE, BACKSPACE, VOLUME_UP, VOLUME_DOWN (case-insensitive; "
+                "synonyms: esc, del, vol_up, vol_down)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "key": {"type": "string"},
+                },
+                "required": ["platform", "key"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="wait_for",
+            description=(
+                "Wait until an element with the given id or text becomes visible. "
+                "timeout is in seconds (default 10)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1, "default": 10},
+                },
+                "required": ["platform"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="assert_visible",
+            description="Assert an element with the given id or text is currently visible.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "id": {"type": "string"},
+                    "text": {"type": "string"},
                 },
                 "required": ["platform"],
                 "additionalProperties": False,
@@ -406,10 +707,48 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "ping":
         return [TextContent(type="text", text="pong")]
 
+    p: Platform = arguments["platform"]
+
     if name == "screenshot":
-        result = _do_screenshot(arguments["platform"])
+        result = _do_screenshot(p)
     elif name == "view_hierarchy":
-        result = _do_hierarchy(arguments["platform"])
+        result = _do_hierarchy(p)
+    elif name == "launch_app":
+        result = _do_launch_app(p, arguments["bundle_id"])
+    elif name == "kill_app":
+        result = _do_kill_app(p, arguments["bundle_id"])
+    elif name == "tap":
+        result = _do_tap(
+            p,
+            id=arguments.get("id"),
+            text=arguments.get("text"),
+            point=arguments.get("point"),
+        )
+    elif name == "scroll":
+        result = _do_scroll(
+            p,
+            direction=arguments["direction"],
+            distance=arguments.get("distance", "short"),
+        )
+    elif name == "swipe":
+        result = _do_swipe(p, start=arguments["start"], end=arguments["end"])
+    elif name == "type_text":
+        result = _do_type_text(p, arguments["text"])
+    elif name == "press_key":
+        result = _do_press_key(p, arguments["key"])
+    elif name == "wait_for":
+        result = _do_wait_for(
+            p,
+            id=arguments.get("id"),
+            text=arguments.get("text"),
+            timeout=arguments.get("timeout", 10),
+        )
+    elif name == "assert_visible":
+        result = _do_assert_visible(
+            p,
+            id=arguments.get("id"),
+            text=arguments.get("text"),
+        )
     else:
         raise ValueError(f"Unknown tool: {name}")
 
