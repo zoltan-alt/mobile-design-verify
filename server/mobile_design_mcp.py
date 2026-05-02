@@ -128,6 +128,27 @@ def _select_device_id(platform: Platform) -> str:
     )
 
 
+def _find_maestro() -> str | None:
+    """Find the maestro executable.
+
+    PATH first (``shutil.which``), then fall back to the well-known curl-install
+    location ``~/.maestro/bin/maestro[.bat]``. Robust on Windows where Claude
+    Code launches the MCP subprocess with the Windows user PATH, not Bash's —
+    so a fresh ``~/.maestro/bin`` addition to ``.bashrc`` doesn't propagate.
+    """
+    on_path = shutil.which("maestro")
+    if on_path:
+        return on_path
+    if os.name == "nt":
+        bat = Path.home() / ".maestro" / "bin" / "maestro.bat"
+        if bat.exists():
+            return str(bat)
+    fallback = Path.home() / ".maestro" / "bin" / "maestro"
+    if fallback.exists():
+        return str(fallback)
+    return None
+
+
 def _run_maestro(
     args: list[str], timeout: int = MAESTRO_DEFAULT_TIMEOUT_SEC
 ) -> dict[str, Any]:
@@ -136,11 +157,12 @@ def _run_maestro(
     Return shape:
       ``{"ok": bool, "error": str|None, "stdout": str, "stderr_tail": str, "exit": int}``
     """
-    if not shutil.which("maestro"):
+    maestro_exe = _find_maestro()
+    if not maestro_exe:
         return {
             "ok": False,
             "error": (
-                "`maestro` not found on PATH. Install: "
+                "`maestro` not found on PATH or at ~/.maestro/bin/. Install: "
                 "https://maestro.mobile.dev/getting-started/installing-maestro"
             ),
             "stdout": "",
@@ -149,7 +171,7 @@ def _run_maestro(
         }
     try:
         proc = subprocess.run(
-            ["maestro", *args],
+            [maestro_exe, *args],
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
