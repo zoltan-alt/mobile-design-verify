@@ -7,9 +7,10 @@ This file lists all third-party software incorporated into or required by
 
 | Package | License | Source |
 | --- | --- | --- |
-| (none yet) | — | — |
+| `mcp[cli]` | MIT | https://github.com/modelcontextprotocol/python-sdk |
+| `pillow` | MIT-CMU (HPND) | https://github.com/python-pillow/Pillow |
 
-Populated automatically as dependencies are added; verified via `pip-licenses` in the pre-publish checklist.
+Populated as dependencies are added; verified via `pip-licenses` in the pre-publish checklist.
 
 ## External tools (not bundled — runtime dependencies)
 
