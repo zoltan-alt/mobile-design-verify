@@ -502,6 +502,46 @@ def _do_assert_visible(
     return _run_flow(platform, flow)
 
 
+def _do_screenshot_scrolling(
+    platform: Platform,
+    count: int = 3,
+) -> dict[str, Any]:
+    """Take ``count`` screenshots while scrolling down to capture tall content.
+
+    Each iteration: take a screenshot at the current scroll position, then
+    swipe upward by ~70% of viewport (finger movement up = content scrolls up,
+    revealing what's below) before the next capture. If the screen has fewer
+    pages of content than ``count``, trailing screenshots may show the same
+    view (already at the bottom). Leaves the screen at its final scroll
+    position; call ``scroll(direction="down", distance="long")`` to return.
+
+    Returns ``{"ok": True, "paths": [...]}`` with paths in top-to-bottom order.
+    """
+    if count < 1:
+        return {"ok": False, "error": "count must be >= 1"}
+
+    paths: list[str] = []
+    for i in range(count):
+        if i > 0:
+            scroll_result = _do_scroll(platform, direction="up", distance="long")
+            if not scroll_result["ok"]:
+                return {
+                    "ok": False,
+                    "error": f"scroll between captures {i - 1} and {i} failed: "
+                             f"{scroll_result.get('error')}",
+                    "paths_captured": paths,
+                }
+        shot = _do_screenshot(platform)
+        if not shot["ok"]:
+            return {
+                "ok": False,
+                "error": f"screenshot {i} failed: {shot.get('error')}",
+                "paths_captured": paths,
+            }
+        paths.append(shot["path"])
+    return {"ok": True, "paths": paths}
+
+
 # ---------------------------------------------------------------------------
 # MCP server + tool registration
 # ---------------------------------------------------------------------------
@@ -544,6 +584,31 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {"platform": _platform_prop()},
+                "required": ["platform"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="screenshot_scrolling",
+            description=(
+                "Capture multiple PNG screenshots while scrolling down, to "
+                "cover content taller than a single viewport. Returns an "
+                "ordered list of file paths (top -> bottom). Use when a single "
+                "`screenshot` would miss content below the fold. Leaves the "
+                "screen at the final scroll position."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 3,
+                        "description": "Number of screenshots to take.",
+                    },
+                },
                 "required": ["platform"],
                 "additionalProperties": False,
             },
@@ -713,6 +778,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = _do_screenshot(p)
     elif name == "view_hierarchy":
         result = _do_hierarchy(p)
+    elif name == "screenshot_scrolling":
+        result = _do_screenshot_scrolling(
+            p,
+            count=arguments.get("count", 3),
+        )
     elif name == "launch_app":
         result = _do_launch_app(p, arguments["bundle_id"])
     elif name == "kill_app":
