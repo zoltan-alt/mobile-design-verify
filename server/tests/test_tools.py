@@ -13,7 +13,9 @@ import pytest  # noqa: E402
 
 from mobile_design_mcp import (  # noqa: E402
     _do_playground_create,
+    _find_widget_by_id,
     _normalize_key,
+    _parse_bounds,
     _playground_root,
     _render_flow,
     _scroll_coords,
@@ -252,3 +254,68 @@ def test_playground_root_returns_path_under_temp(monkeypatch):
     monkeypatch.setenv("TEMP", r"C:\fake-temp")
     root = _playground_root()
     assert "mobile-design-playground" in str(root)
+
+
+# ---------------------------------------------------------------------------
+# _parse_bounds — Maestro's two formats
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bounds_string_format():
+    result = _parse_bounds("[10,20][110,220]")
+    assert result == {"x": 10, "y": 20, "width": 100, "height": 200}
+
+
+def test_parse_bounds_dict_format():
+    result = _parse_bounds({"x": 5, "y": 8, "width": 50, "height": 60})
+    assert result == {"x": 5, "y": 8, "width": 50, "height": 60}
+
+
+def test_parse_bounds_invalid_string_returns_none():
+    assert _parse_bounds("not bounds") is None
+
+
+def test_parse_bounds_none_returns_none():
+    assert _parse_bounds(None) is None
+
+
+# ---------------------------------------------------------------------------
+# _find_widget_by_id
+# ---------------------------------------------------------------------------
+
+
+def test_find_widget_by_id_root():
+    tree = {"resource-id": "home-greeting", "bounds": "[0,0][1080,200]"}
+    found = _find_widget_by_id(tree, "home-greeting")
+    assert found is tree
+
+
+def test_find_widget_by_id_recurses():
+    tree = {
+        "resource-id": "root",
+        "children": [
+            {"resource-id": "child-a"},
+            {
+                "resource-id": "child-b",
+                "children": [{"resource-id": "grandchild"}],
+            },
+        ],
+    }
+    found = _find_widget_by_id(tree, "grandchild")
+    assert found == {"resource-id": "grandchild"}
+
+
+def test_find_widget_by_id_uses_accessibility_identifier_too():
+    tree = {"accessibilityIdentifier": "ios-style-id"}
+    found = _find_widget_by_id(tree, "ios-style-id")
+    assert found is tree
+
+
+def test_find_widget_by_id_returns_none_when_missing():
+    tree = {"resource-id": "root", "children": [{"resource-id": "a"}]}
+    assert _find_widget_by_id(tree, "nope") is None
+
+
+def test_find_widget_by_id_handles_non_dict_input():
+    assert _find_widget_by_id("not a dict", "anything") is None
+    assert _find_widget_by_id(None, "anything") is None

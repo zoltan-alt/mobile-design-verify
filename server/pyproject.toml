@@ -23,6 +23,8 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.0",
+    # Designer mode visual diff (compare_to_reference tool).
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

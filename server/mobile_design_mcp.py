@@ -1080,6 +1080,198 @@ def _do_flutter_stop(project_path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Designer mode — widget inspector (bounds + a11y info from view hierarchy)
+# ---------------------------------------------------------------------------
+
+
+def _find_widget_by_id(node: Any, identifier: str) -> dict[str, Any] | None:
+    """Walk a pruned a11y tree to find the first node with matching id."""
+    if not isinstance(node, dict):
+        return None
+    rid = node.get("resource-id") or node.get("accessibilityIdentifier")
+    if rid == identifier:
+        return node
+    for child in node.get("children", []) or []:
+        found = _find_widget_by_id(child, identifier)
+        if found is not None:
+            return found
+    return None
+
+
+def _parse_bounds(bounds: Any) -> dict[str, int] | None:
+    """Maestro bounds come as ``[x1,y1][x2,y2]`` strings or as
+    ``{"x":..,"y":..,"width":..,"height":..}`` objects. Normalize.
+    """
+    if isinstance(bounds, dict):
+        x = int(bounds.get("x", 0))
+        y = int(bounds.get("y", 0))
+        w = int(bounds.get("width", 0))
+        h = int(bounds.get("height", 0))
+        return {"x": x, "y": y, "width": w, "height": h}
+    if isinstance(bounds, str):
+        import re as _re
+        m = _re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if m:
+            x1, y1, x2, y2 = (int(g) for g in m.groups())
+            return {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+    return None
+
+
+def _do_inspect_widget(platform: Platform, identifier: str) -> dict[str, Any]:
+    """Look up a widget by Semantics identifier in the live a11y tree.
+
+    Returns the widget's bounds (x/y/width/height pixels), text content,
+    and class name. Bounds come from Maestro's hierarchy snapshot — not
+    a deep VM-service inspection — so color/font/baseline aren't here
+    yet. They can be added later via Flutter Inspector RPC if needed.
+    """
+    if not identifier:
+        return {"ok": False, "error": "identifier is required"}
+
+    hier = _do_hierarchy(platform)
+    if not hier["ok"]:
+        return hier
+
+    tree = hier.get("hierarchy")
+    if tree is None:
+        return {"ok": False, "error": "no hierarchy returned"}
+
+    node = _find_widget_by_id(tree, identifier)
+    if node is None:
+        return {
+            "ok": False,
+            "error": f"no widget with identifier {identifier!r} in the hierarchy",
+        }
+
+    return {
+        "ok": True,
+        "identifier": identifier,
+        "bounds": _parse_bounds(node.get("bounds")),
+        "text": node.get("text"),
+        "class": node.get("class"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Designer mode — visual diff against a reference image
+# ---------------------------------------------------------------------------
+
+
+def _latest_screenshot() -> Path | None:
+    """Find the newest PNG under the screenshots directory, if any."""
+    shots = Path(SCREENSHOTS_DIR).resolve()
+    if not shots.is_dir():
+        return None
+    candidates = sorted(
+        shots.glob("*.png"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _do_compare_to_reference(
+    reference_path: str,
+    current_path: str | None = None,
+    threshold: int = 30,
+) -> dict[str, Any]:
+    """Visual diff: compare a current screenshot to a reference image.
+
+    Reports the fraction of differing pixels, the bounding box of the
+    differing region, and writes an overlay PNG (red tint on differing
+    pixels, original elsewhere) under ``tmp/screenshots/``.
+
+    ``threshold`` is the per-channel intensity difference above which a
+    pixel counts as "changed". Default 30 ignores small color/encoding
+    drift but catches real layout / color shifts.
+
+    If ``current_path`` is omitted, the newest PNG in
+    ``tmp/screenshots/`` is used.
+    """
+    try:
+        from PIL import Image, ImageChops, ImageStat
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "Pillow is required (pip install pillow into the server venv)",
+        }
+
+    ref = Path(reference_path)
+    if not ref.is_file():
+        return {"ok": False, "error": f"reference image not found: {reference_path}"}
+
+    if current_path is None:
+        latest = _latest_screenshot()
+        if latest is None:
+            return {
+                "ok": False,
+                "error": (
+                    "no current_path given and tmp/screenshots/ is empty — "
+                    "take a screenshot first"
+                ),
+            }
+        current_path = str(latest)
+
+    cur = Path(current_path)
+    if not cur.is_file():
+        return {"ok": False, "error": f"current screenshot not found: {current_path}"}
+
+    img_ref = Image.open(ref).convert("RGB")
+    img_cur = Image.open(cur).convert("RGB")
+
+    if img_ref.size != img_cur.size:
+        img_ref = img_ref.resize(img_cur.size, Image.LANCZOS)
+
+    diff = ImageChops.difference(img_ref, img_cur)
+    diff_gray = diff.convert("L")
+    mask = diff_gray.point(lambda p: 255 if p > threshold else 0, mode="L")
+
+    # Count "different" pixels = sum of mask / 255.
+    stat = ImageStat.Stat(mask)
+    diff_count = int(stat.sum[0]) // 255
+    width, height = img_cur.size
+    total = width * height
+    diff_ratio = diff_count / total if total else 0.0
+
+    if diff_count == 0:
+        return {
+            "ok": True,
+            "match": True,
+            "diff_ratio": 0.0,
+            "diff_pixels": 0,
+            "image_size": [width, height],
+            "current_path": str(cur.resolve()),
+        }
+
+    # Bounding box of all differing pixels (single rect — coarse but
+    # surfaces "is the diff in a small region or scattered").
+    bbox = mask.getbbox()
+
+    # Overlay: paste a red layer onto the current screenshot, masked
+    # to differing pixels. Fast — no per-pixel Python loop.
+    overlay = img_cur.copy()
+    red = Image.new("RGB", overlay.size, (255, 60, 60))
+    overlay.paste(red, (0, 0), mask=mask.convert("1"))
+
+    shots_dir = Path(SCREENSHOTS_DIR).resolve()
+    shots_dir.mkdir(parents=True, exist_ok=True)
+    overlay_path = shots_dir / f"diff-{_ts()}.png"
+    overlay.save(overlay_path)
+
+    return {
+        "ok": True,
+        "match": diff_ratio < 0.005,
+        "diff_ratio": round(diff_ratio, 4),
+        "diff_pixels": diff_count,
+        "image_size": [width, height],
+        "bounding_box": list(bbox) if bbox else None,
+        "overlay_path": str(overlay_path),
+        "current_path": str(cur.resolve()),
+        "reference_path": str(ref.resolve()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP server + tool registration
 # ---------------------------------------------------------------------------
 
@@ -1176,6 +1368,66 @@ async def list_tools() -> list[Tool]:
                     "project_path": {"type": "string"},
                 },
                 "required": ["project_path"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="inspect_widget",
+            description=(
+                "Designer mode. Look up a widget by its Semantics identifier "
+                "in the live a11y tree and return {bounds, text, class}. "
+                "Bounds come from Maestro's hierarchy snapshot. Use to "
+                "measure rendered positions instead of computing font / "
+                "layout metrics by hand."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "platform": _platform_prop(),
+                    "identifier": {
+                        "type": "string",
+                        "description": "Semantics identifier / accessibilityIdentifier / resource-id.",
+                    },
+                },
+                "required": ["platform", "identifier"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="compare_to_reference",
+            description=(
+                "Designer mode. Compare the latest (or specified) screenshot "
+                "to a reference image. Returns the fraction of differing "
+                "pixels, a bounding box of the differing region, and writes "
+                "a red-tinted overlay PNG to tmp/screenshots/. Use to catch "
+                "design mismatches without the user having to eyeball-compare."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "reference_path": {
+                        "type": "string",
+                        "description": "Absolute path to the reference image (the moodboard).",
+                    },
+                    "current_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to the current screenshot. If omitted, "
+                            "uses the newest PNG in tmp/screenshots/."
+                        ),
+                    },
+                    "threshold": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 255,
+                        "default": 30,
+                        "description": (
+                            "Per-channel intensity diff above which a pixel "
+                            "counts as 'changed'. 30 ignores small encoding drift."
+                        ),
+                    },
+                },
+                "required": ["reference_path"],
                 "additionalProperties": False,
             },
         ),
@@ -1403,6 +1655,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = _do_flutter_stop(arguments["project_path"])
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
+    if name == "compare_to_reference":
+        result = _do_compare_to_reference(
+            reference_path=arguments["reference_path"],
+            current_path=arguments.get("current_path"),
+            threshold=arguments.get("threshold", 30),
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
     p: Platform = arguments["platform"]
 
     if name == "flutter_run":
@@ -1410,6 +1670,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             project_path=arguments["project_path"],
             platform=p,
         )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "inspect_widget":
+        result = _do_inspect_widget(p, identifier=arguments["identifier"])
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     if name == "screenshot":
