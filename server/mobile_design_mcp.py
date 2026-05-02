@@ -393,24 +393,30 @@ def _do_tap(
 def _scroll_coords(direction: str, distance: str) -> tuple[str, str]:
     """Compute (start, end) percentage coordinates for a directional scroll.
 
+    Endpoints stay inside a safe band (25-75%) so the gesture doesn't land on
+    fixed top app bars, bottom navigation bars, or sticky CTA buttons that
+    would otherwise absorb the touch instead of scrolling the content.
+
     direction: "up" / "down" / "left" / "right" (finger movement)
-    distance:  "short" (30%) or "long" (70%)
+    distance:  "short" (~30% travel) or "long" (~50% travel)
     """
-    pct_map = {"short": 30, "long": 70}
-    if distance not in pct_map:
+    if distance == "short":
+        near, far = 65, 35
+    elif distance == "long":
+        near, far = 75, 25
+    else:
         raise ValueError(f"distance must be 'short' or 'long' (got {distance!r})")
-    half = pct_map[distance] // 2
     mid = 50
 
     direction = direction.lower()
     if direction == "up":
-        return f"{mid}%, {mid + half}%", f"{mid}%, {mid - half}%"
+        return f"{mid}%, {near}%", f"{mid}%, {far}%"
     if direction == "down":
-        return f"{mid}%, {mid - half}%", f"{mid}%, {mid + half}%"
+        return f"{mid}%, {far}%", f"{mid}%, {near}%"
     if direction == "left":
-        return f"{mid + half}%, {mid}%", f"{mid - half}%, {mid}%"
+        return f"{near}%, {mid}%", f"{far}%, {mid}%"
     if direction == "right":
-        return f"{mid - half}%, {mid}%", f"{mid + half}%, {mid}%"
+        return f"{far}%, {mid}%", f"{near}%, {mid}%"
     raise ValueError(f"direction must be up/down/left/right (got {direction!r})")
 
 

@@ -86,15 +86,16 @@ def test_scroll_coords_down_short():
 
 def test_scroll_coords_up_long():
     start, end = _scroll_coords("up", "long")
-    # long = 70%, half = 35. UP: start lower, end higher.
-    assert start == "50%, 85%"
-    assert end == "50%, 15%"
+    # long: endpoints clamped to safe band 25-75% so the swipe doesn't land
+    # on top app bars / bottom nav / sticky CTAs that would absorb the touch.
+    assert start == "50%, 75%"
+    assert end == "50%, 25%"
 
 
 def test_scroll_coords_down_long():
     start, end = _scroll_coords("down", "long")
-    assert start == "50%, 15%"
-    assert end == "50%, 85%"
+    assert start == "50%, 25%"
+    assert end == "50%, 75%"
 
 
 def test_scroll_coords_left_short():
@@ -105,8 +106,8 @@ def test_scroll_coords_left_short():
 
 def test_scroll_coords_right_long():
     start, end = _scroll_coords("right", "long")
-    assert start == "15%, 50%"
-    assert end == "85%, 50%"
+    assert start == "25%, 50%"
+    assert end == "75%, 50%"
 
 
 def test_scroll_coords_case_insensitive_direction():
