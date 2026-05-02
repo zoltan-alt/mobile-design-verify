@@ -2,6 +2,9 @@
 BRIEF.md
 LEGAL.md
 
+# Local-only MCP registration (absolute venv paths; switch to portable form before sharing)
+.mcp.json
+
 # Developer environment / Claude Code
 .claude/
 
